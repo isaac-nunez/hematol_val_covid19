@@ -1,0 +1,1579 @@
+---
+title: "Marcadores de inflamación en pacientes con covid19"
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+**Objetivo del estudio**: relación entre marcadores inflamatorios al ingreso hospitalario en pacientes con covid-19 y desenlaces clínicos. Secundario. ¿qué tan útil es pedirlos a cada rato? Sería esperado encontrar lo mismo en pacientes con otras enfermedades agudas?</br>
+**Otra idea**es agregar a controles que tengan neumonía por otro motivo (aunque probablemente el innsz no sea un buen lugar, ya que esos controles tendrán comorbilidades que afecten la inflamación de los pacientes)
+</br>
+**Metodología del estudio**</br>
+-Recopilar TODOS los marcadores, porque todos son potencialmente "útiles".</br>
+-Se determinará cuál es el riesgo de cada uno respecto al desenlace de interés (ingreso a UTI y/o mortalidad).</br>
+-Se intentará determinar un punto de corte para cada uno con curvas ROC. </br>
+-Se intentará determinar si una combinación de todos vs BH(con los índices estipulados, en caso de que resulten relevantes en el análisis univariado) si no, sólo con leucos/linfos totales Y pcr (la cual en teoría debería estar disponible en todas partes).</br>
+-En caso de que las curvas ROC resulten similares, se determinará por medio de un criterio de información (Ej. Akaike) si realmente vale más la pena usar todos los marcadores o si es relativamente igual el resultado de usar uno u otro.</br>
+
+**NOTAS**  
+Cómo decidimos la manera en la cual usaremos los marcadores?  
+Si este estudio es de cinética, sería algo muy diferente a usarlo de curva roc. Quizá si hacemos la curva roc justo al ingreso y el resto del papaer lo enfocamos en la cinética que llevan los marcadores.</br>
+-HACER CURVAS CON LA MEDIANA DEL MARCADOR PARA ESE DÍA Y LUEGO PARA EL RESTO. Checar este paper.
+https://journals.lww.com/anesthesia-analgesia/FullText/2014/09000/C_Reactive_Protein_Kinetics_After_Major_Surgery.19.aspx  
+-Al parecer está desactivada la opción de descargar la base de un laboratorio directo desde labsis. Dejaré eso pendiente. 
+
+
+**Cargando los paquetes y bases correspondientes**
+```{r config, include = F,warning = F,message=F}
+library(tidyverse);library(lubridate);library(survival);library(survminer);library(readxl);library(rms);
+library(patchwork);library(stddiff);library(flextable);library(knitr);library(pROC);library(agricolae)
+
+
+base_covid <- read_excel("~/Protocolos de investigación/BASE COVID Rs/base_covid_23.05.2020.xlsx")
+names(base_covid) <- tolower(names(base_covid))
+
+base_labs <- read_excel("~/Protocolos de investigación/BASE COVID Rs/base_covid_23.05.2020.xlsx",
+                         sheet = "LAB_INGRESO")
+names(base_labs) <- tolower(names(base_labs))
+
+#Aquí abajo cargo el resto de los labs por si llegara a necesitar alguno más adelante (los labs de ingreso ya los integraron en la base principal)
+
+primer_desenlace <- read_excel("~/Protocolos de investigación/BASE COVID Rs/base_covid_23.05.2020.xlsx",
+                         sheet = "LAB_PRIMER_DESENLACE")
+names(primer_desenlace) <- tolower(names(primer_desenlace))
+
+
+
+lab_post_uti <- read_excel("~/Protocolos de investigación/BASE COVID Rs/base_covid_23.05.2020.xlsx",
+                         sheet = "LAB_DESENLACE_POST_UTI")
+names(lab_post_uti) <- tolower(names(lab_post_uti))
+
+
+
+req_o2 <- read_excel("~/Protocolos de investigación/BASE COVID Rs/base_covid_23.05.2020.xlsx",
+                         sheet = "REQUERIMIENTO_O2")
+names(req_o2) <- tolower(names(req_o2))
+
+#Esta base la estoy agregando porque la base que me pasaron hoy tiene muchas fechas de urgencias faltantes
+base_cov_18_05_20 <- read_excel("~/Protocolos de investigación/BASE COVID Rs/base_cov_nueva_18_05_20.xlsx")
+names(base_cov_18_05_20) <- tolower(names(base_cov_18_05_20))
+```
+
+**Producto de este chunk:** *base_cov_gral*
+```{r creación de la base general base_cov_gral, include = F,warning = F,message=F}
+
+#Aquí limpio la base de info general, muchas de las variables no están bien codificadas pero curiosamente por lo general si hay una variable por columnna
+base_covid_gral <- base_covid %>% 
+  mutate(fecha_sts = ymd(fecha_incio_sintomas),  
+         fecha_ing_urg = ymd(fecha_ingreso_urgencias), 
+         fecha_ing_piso = ymd(fecha_ingreso_piso),
+         fecha_outcome = as.Date(as.numeric(fecha_primer_descenlace), origin = "1900-01-01"),
+         registro = as.numeric(registro),
+         sexo = ifelse(sexo == "HOMBRE", "h", "m"),
+         imc = as.numeric(imc),
+         categ_peso = ifelse(imc >=18.5 & imc<25, "normal", 
+                             ifelse(imc<18.5, "bajo",
+                                    ifelse(imc>=25 & imc<30, "sobrepeso", 
+                                           ifelse(imc>=30 & imc<35, "obes_1",
+                                                  ifelse(imc>=35 & imc<40, "obes_2",
+                                                         "obes_3")))))) %>%
+  separate(otra_comorbilidad, sep = ",", into = c("comorb1", "comorb2", "comorb3")) %>% 
+  separate(ta, sep = "/", into = c("ta_sist", "ta_diast")) %>% 
+  mutate(comorb1 = ifelse(comorb1 == "NO", NA, comorb1),
+         comorb1 = tolower(comorb1),
+         comorb2 = tolower(comorb2),
+         comorb3 = tolower(comorb3),
+         diabetes = if_else(diabetes == "SI", T, F),
+         hipertension = if_else(hipertension == "SI", T, F),
+         sato2_aa = as.numeric(spo2_aa),
+         sato2_aa = if_else(sato2_aa < 1, sato2_aa*100, sato2_aa),
+         temperatura = as.numeric(temperatura),
+         ta_sist = as.numeric(ta_sist),
+         ta_diast = as.numeric(ta_diast),
+         pam = round(((ta_sist - ta_diast)/3)+ta_diast,0),
+         disnea = if_else(disnea == "SI", T, F),
+           fiebre = if_else(fiebre =="SI", T, F),
+           dolor_toracico = if_else(dolor_toracico == "SI", T, F),
+           cefalea = if_else(cefalea == "SI", T, F), 
+           mialgias = if_else(mialgias =="SI", T, F),
+           diarrea = if_else(diarrea == "SI", T, F),
+         tos = if_else(tos == "SI", T, F),
+         psi_port_clase = as.numeric(psi_port_clase),
+         curb65 = as.numeric(curb65),
+         q_sofa = as.numeric(q_sofa),
+         news = as.numeric(news),
+         tac = if_else(tac_afeccion == "LEVE", 1, 
+                       if_else(tac_afeccion == "MODERADA", 2, 3)),
+         mr = if_else(masacarilla_reservorio == "SI", T, F),
+         max_o2 = if_else(requerimiento_max_o2 == "NO", 0, as.numeric(requerimiento_max_o2)),
+         muerte = ifelse(startsWith(primer_desenlace, "DEF"), T, 
+                          ifelse(primer_desenlace == "EGRESO", F, NA)),
+         fecha_muerte = ifelse(muerte == T, fecha_outcome, NA),
+         ing_uti = ifelse(primer_desenlace == "UTI", T, 
+                          ifelse(primer_desenlace == "EGRESO", F, NA)),
+         fecha_ing_uti = ifelse(ing_uti == T, fecha_outcome, NA),
+         egreso = ifelse(primer_desenlace == "EGRESO", T, F),
+         primer_desenlace = tolower(primer_desenlace),
+         tocilizumab = if_else(tocilizumab == "SI", T, F))%>% 
+  select(-fecha_incio_sintomas, -fecha_ingreso_urgencias, -fecha_ingreso_piso, - peso, -spo2_aa,
+          -tac_afeccion, -masacarilla_reservorio, -requerimiento_max_o2, -nombre, 
+         -fecha_primer_descenlace) %>%
+  group_by(registro) %>% 
+  arrange(.by_group = T, fecha_ing_urg) %>% 
+  slice(1)
+```
+
+```{r creacion de la base del 1-05-2020 para posteriormente agregar las fechas, include = F,message=F,warning = F}
+base_cov_18 <- base_cov_18_05_20 %>% 
+  mutate(fecha_sts = as.Date(as.numeric(fecha_incio_sintomas), origin = "1900-01-01"),  
+         fecha_ing_urg = as.Date(as.numeric(fecha_ingreso_urgencias), origin = "1900-01-01"), 
+         fecha_ing_piso = as.Date(as.numeric(fecha_ingreso_piso), origin = "1900-01-01"),
+         fecha_outcome = as.Date(as.numeric(fecha_primer_descenlace), origin = "1900-01-01"),
+         registro = as.numeric(registro),
+         primer_desenlace = tolower(primer_desenlace),
+         egreso = if_else(primer_desenlace == "egreso", T, F)) %>% 
+  select(registro, fecha_sts, fecha_ing_urg, fecha_ing_piso, fecha_outcome, primer_desenlace, egreso) %>% 
+  filter(!is.na(fecha_sts) & !is.na(fecha_ing_urg) & !is.na(fecha_ing_piso))
+
+```
+
+
+En este chunk modifico los formatos de manera que ya no sean fechas, sino números tradicionales (para que las variables numéricas lo sean)
+```{r creación de la base de labs al ingreso, include = F,warning = F,message=F}
+#Para reciclar el código que ya había hecho, primero voy a partir la base en dos y luego la pondré en los chunks que ya tenía previamente hechos#######################################
+base_labs2 <- group_by(base_labs, registro) %>% 
+  filter(registro %in% base_covid_gral$registro) %>% 
+  slice(1)
+
+
+
+base_covid_labs <- base_labs2
+
+for(i in 3:ncol(base_covid_labs)){
+   base_covid_labs[,i] <- as.numeric(unlist(base_covid_labs[,i]))
+}
+
+
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Sigue hacer que los datos que se metieron como fechas estén con el formato adecuado
+#Esto lo haré creando una función que corrija el formato de la fecha y corriéndola con todas las variables, de manera que solo transforme las casillas que tengan el formato de fecha (y por ende, el que queremos cambiar)
+  
+fech_form <- function(x){
+   as.numeric(str_c(substr(as.Date(x, origin = "1900-01-01"), 9, 10), ".", 
+         substr(as.Date(x, origin = "1900-01-01"), 6, 7)))
+}
+ 
+for(i in 3:ncol(base_covid_labs)){
+  for(j in 1:nrow(base_covid_labs)){
+    base_covid_labs[j,i] <- if_else(base_covid_labs[j,i] >40000 & base_covid_labs[j,i]<50000,
+                                fech_form(unlist(base_covid_labs[j,i])),
+                                as.numeric(base_covid_labs[j,i]))
+}
+}
+base_covid_labs$registro <- as.numeric(base_covid_labs$registro)
+#Confirmación de que todas las variables se convirtieron adecuadamente a su formato y ya no son fechas ----->>>>>>any(base_covid_labs[,-1] > 40000, na.rm = T)
+
+#Aquí uno la base de características clínicas con la de los laboratorios
+covid_full <- base_covid_gral %>% 
+  full_join(base_covid_labs, by = "registro") #Hay 250 filas, pero solo 229 registros. INVESTIGUEMOS
+
+ 
+reg_rep <- covid_full %>% 
+  group_by(registro) %>% 
+  arrange(.by_group = T, by = fecha_ing_urg) %>% 
+  summarise(n = n()) %>% 
+  filter(n >1) #Hay 7 registros que se repite 4 veces cada uno
+  
+covid_rep <- filter(covid_full, registro%in%reg_rep$registro) #son los registros que se repiten, ahora quedaron unos con NA y otros que siguen repitiendose y que no son reingresos. LAS QUITARÉ DEL ANÁLISIS PENDIENTE A REMEDIAR ESTE DETALLE)
+
+covid_full_2 <- covid_full %>% 
+  anti_join(covid_rep, by = "registro")
+#n_distinct(covid_full_2$registro) --->>> 239 registros. COMENCEMOS
+```
+
+En este punto, se hará un EDA con énfasis en que las variables estén correctamente codificadas (rango de fechas, que los valores estén correctamente introducidos, etc). Esto probablamente tenga que dejarlo para después por fines de tiempo, pero es importante que lo cheque, porque a lo que he visto es altamente probable que se hayan cometido múltiples errores en cuanto al formato de las variables que se introducen en las casillas. </br>
+</br>
+**Cuáles marcadores incluír?**</br>
+-Dímero D  
+-Fibrinógeno  
+-PCR  
+-CPK  
+-DHL  
+-Ferritina  
+-Índices hematológicos (neu/linf, plaq/linf) etc etc
+
+**¿Cuáles son los registros que no tienen una fecha de ingreso o que no tienen una fecha de ingreso a urgencias posterior a hospitalización, por ejemplo**  
+Hay muchas fechas de ingreso a urgencias que están faltantes, aquí uniré la base nueva con la anterior de manera que se puedan recuperar algunos de ellos.
+```{r CHUNK PENDIENTEretiro de pacientes con informacion faltante y sin fecha de última observación, include = F,message=F,warning = F}
+#Algunas fechas están mal (muy adelantadas o muy atrasadas), habrá que filtrarlas
+covid_full_3 <- covid_full_2 
+
+#Quedan 230 pacientes, estos son los registros de los que faltan (un total de 46):
+registros_faltantes <- base_covid  %>% 
+  mutate(registro = as.numeric(registro)) %>% 
+  anti_join(covid_full_3, by = "registro") %>% 
+  select(registro)
+
+
+
+#write.csv(registros_faltantes, file = "registros_faltantes.csv")
+```
+
+**Creación de los índices hematológicos**
+```{r indices hematologicos y formato a la porción de laboratorios, include = F,message=F,warning = F}
+covid_full_4 <- covid_full_3 %>% 
+  mutate(nlymr = round(neutrofilos_por_ingreso/linfocitos_por_ingreso,2),#neutrophil lymphocyte ratio
+         dnlr = round(((neutrofilos_por_ingreso/100)*leucocitos_ingreso)/
+           (leucocitos_ingreso-((neutrofilos_por_ingreso/100)*leucocitos_ingreso)),2),#derived neutrophil ratio
+         plr = round(plaquetas_ingreso/((linfocitos_por_ingreso/100)*leucocitos_ingreso),2),#platelet to lymphocyte ratio
+         lmr = round(linfocitos_por_ingreso/monocitos_por_ingreso,2),#lymphocite to monocyte ratio
+         sobrevida_primer_evento = fecha_outcome - fecha_ing_urg,
+         desenlace_uti = if_else(primer_desenlace == "uti", 1, 0), 
+         mujer = if_else(sexo == "m", T, F),
+         neutrofilos_totales = round((leucocitos_ingreso*1000)*(neutrofilos_por_ingreso/100),0),
+         linfocitos_totales = round((leucocitos_ingreso*1000)*(linfocitos_por_ingreso/100),0),
+         monocitos_totales = round((leucocitos_ingreso*1000)*(monocitos_por_ingreso/100),0))#ESTA VARIABLE CAMBIARÁ CUANDO HAGA LOS MODELOS DE RIESGO EN COMPETENCIA (si es que los llego a hacer por cuestiones de tiempo)
+```
+
+
+Modelos de riesgo   
+**OJO**: esta es una versión rápida y sucia, no he hecho DAGs ni un ejercicio similar, entonces podría cambiar. En este momento creo que no valdría la pena hacerlos ajustados ya que seguramente muchos se correlacionarían y probablemente esté sobreajustando. 
+
+En esta el producto final son las gráficas de los ajustes por splines para los índices hematológicos. 
+```{r splines UNIVARIADOS indices hematológicos, echo = F,warning = F,message=F}
+#UNIVARIADOS CON SPLINES PARA NLYMR
+uni_nlymr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(nlymr,3), data = covid_full_4)
+
+coxnlymr_uv <- termplot(uni_nlymr, se=TRUE, plot = F)$nlymr
+centernlymr_uv <- with(coxnlymr_uv, y[x == 5])
+cinlymr_uv <- coxnlymr_uv$y + outer(coxnlymr_uv$se, c(0, -1.96, 1.96), '*')
+
+nlymru_df <- data.frame(nlymr_count = coxnlymr_uv$x, 
+                     y = coxnlymr_uv$y,
+                     se = coxnlymr_uv$se,
+                     lower_ci = cinlymr_uv[,2],
+                     upper_ci = cinlymr_uv[,3],
+                     mean_ci = cinlymr_uv[,1])
+
+nlymr_univar <- nlymru_df[with(nlymru_df, nlymr_count == 2.5 | nlymr_count == 5 | nlymr_count == 9.89 | 
+              nlymr_count == 15.05 |nlymr_count== 19.77),] %>% 
+  mutate(hr = round(exp(y-centernlymr_uv),2),
+         upper_hr = round(exp(upper_ci-centernlymr_uv),2),
+         lower_hr = round(exp(lower_ci-centernlymr_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+nlymr_spline_plot <- ggplot(nlymru_df, aes(x = nlymr_count, y = exp(mean_ci - centernlymr_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centernlymr_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centernlymr_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Neutrophil-to-lymphocyte ratio at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  scale_y_continuous(breaks = (seq(0,10,1))) +
+  scale_x_continuous(breaks = (seq(0,60,10))) +
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,30))
+
+#UNIVARIADOS CON SPLINES PARA DNLR
+uni_dnlr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(dnlr,3), data = covid_full_4)
+
+coxdnlr_uv <- termplot(uni_dnlr, se=TRUE, plot = F)$dnlr
+centerdnlr_uv <- with(coxdnlr_uv, y[x == 9.99])
+cidnlr_uv <- coxdnlr_uv$y + outer(coxdnlr_uv$se, c(0, -1.96, 1.96), '*')
+
+dnlru_df <- data.frame(dnlr_count = coxdnlr_uv$x, 
+                     y = coxdnlr_uv$y,
+                     se = coxdnlr_uv$se,
+                     lower_ci = cidnlr_uv[,2],
+                     upper_ci = cidnlr_uv[,3],
+                     mean_ci = cidnlr_uv[,1])
+
+dnlr_univar <- dnlru_df[with(dnlru_df, dnlr_count == 1.01 | dnlr_count == 3 | dnlr_count == 4.99 | 
+              dnlr_count == 9.99 |dnlr_count== 14.87),] %>% 
+  mutate(hr = round(exp(y-centerdnlr_uv),2),
+         upper_hr = round(exp(upper_ci-centerdnlr_uv),2),
+         lower_hr = round(exp(lower_ci-centerdnlr_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+dnlr_spline_plot <- ggplot(dnlru_df, aes(x = dnlr_count, y = exp(mean_ci - centerdnlr_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerdnlr_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerdnlr_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Derived neutrophil index at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  scale_y_continuous(breaks = (seq(0,10,1))) +
+  scale_x_continuous(breaks = (seq(0,35,5))) +
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,35))
+
+
+#UNIVARIADOS CON SPLINES PARA PLATELET-LYMPHOCITE RATIO (PLR)
+uni_plr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(plr,3), data = covid_full_4)
+
+coxplr_uv <- termplot(uni_plr, se=TRUE, plot = F)$plr
+centerplr_uv <- with(coxplr_uv, y[x == 180.66])
+ciplr_uv <- coxplr_uv$y + outer(coxplr_uv$se, c(0, -1.96, 1.96), '*')
+
+plru_df <- data.frame(plr_count = coxplr_uv$x, 
+                     y = coxplr_uv$y,
+                     se = coxplr_uv$se,
+                     lower_ci = ciplr_uv[,2],
+                     upper_ci = ciplr_uv[,3],
+                     mean_ci = ciplr_uv[,1])
+
+plr_univar <- plru_df[with(plru_df,  plr_count == 40.17 | plr_count == 120.20 | plr_count == 180.66 | 
+              plr_count == 238.17 | plr_count== 299.04),] %>% 
+  mutate(hr = round(exp(y-centerplr_uv),2),
+         upper_hr = round(exp(upper_ci-centerplr_uv),2),
+         lower_hr = round(exp(lower_ci-centerplr_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+plr_spline_plot <- ggplot(plru_df, aes(x = plr_count, y = exp(mean_ci - centerplr_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerplr_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerplr_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Platelet-lymphocyte index at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1))) +
+  scale_x_continuous(breaks = (seq(0,500,50)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0, 500))
+
+
+#UNIVARIADOS CON SPLINES PARA LYMPHOCITE-MONOCYTE RATIO (LMR)
+uni_lmr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(lmr,3), data = covid_full_4)
+
+coxlmr_uv <- termplot(uni_lmr, se=TRUE, plot = F)$lmr
+centerlmr_uv <- with(coxlmr_uv, y[x == 1.5])
+cilmr_uv <- coxlmr_uv$y + outer(coxlmr_uv$se, c(0, -1.96, 1.96), '*')
+
+lmru_df <- data.frame(lmr_count = coxlmr_uv$x, 
+                     y = coxlmr_uv$y,
+                     se = coxlmr_uv$se,
+                     lower_ci = cilmr_uv[,2],
+                     upper_ci = cilmr_uv[,3],
+                     mean_ci = cilmr_uv[,1])
+
+lmr_univar <- lmru_df[with(lmru_df, lmr_count == 0.5 | lmr_count == 1 | lmr_count == 1.5 | 
+              lmr_count == 2 | lmr_count== 2.5),] %>% 
+  mutate(hr = round(exp(y-centerlmr_uv),2),
+         upper_hr = round(exp(upper_ci-centerlmr_uv),2),
+         lower_hr = round(exp(lower_ci-centerlmr_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+lmr_spline_plot <- ggplot(lmru_df, aes(x = lmr_count, y = exp(mean_ci - centerlmr_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerlmr_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerlmr_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Lymphocyte-monocite index at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,10,2)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,10))
+
+
+#UNIVARIADOS CON SPLINES PARA NEUTRÓFILOS TOTALES
+uni_neu <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(neutrofilos_totales,3), 
+                 data = covid_full_4)
+
+coxneu_uv <- termplot(uni_neu, se=TRUE, plot = F)$neutrofilos_totales
+centerneu_uv <- with(coxneu_uv, y[x == 4998])
+cineu_uv <- coxneu_uv$y + outer(coxneu_uv$se, c(0, -1.96, 1.96), '*')
+
+neuu_df <- data.frame(neu_count = coxneu_uv$x, 
+                     y = coxneu_uv$y,
+                     se = coxneu_uv$se,
+                     lower_ci = cineu_uv[,2],
+                     upper_ci = cineu_uv[,3],
+                     mean_ci = cineu_uv[,1])
+
+neu_univar <- neuu_df[with(neuu_df, neu_count == 2027 | neu_count == 4998 | neu_count == 10008 | 
+              neu_count == 15135 | neu_count== 20281),] %>% 
+  mutate(hr = round(exp(y-centerneu_uv),2),
+         upper_hr = round(exp(upper_ci-centerneu_uv),2),
+         lower_hr = round(exp(lower_ci-centerneu_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+neu_spline_plot <- ggplot(neuu_df, aes(x = neu_count, y = exp(mean_ci - centerneu_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerneu_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerneu_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Total neutrophils at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,20000,5000)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,20000))
+
+#UNIVARIADOS CON SPLINES PARA LINFOS TOTALES
+uni_linf <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(linfocitos_totales,3), 
+                 data = covid_full_4)
+
+coxlinf_uv <- termplot(uni_linf, se=TRUE, plot = F)$linfocitos_totales
+centerlinf_uv <- with(coxlinf_uv, y[x == 997])
+cilinf_uv <- coxlinf_uv$y + outer(coxlinf_uv$se, c(0, -1.96, 1.96), '*')
+
+linfu_df <- data.frame(linf_count = coxlinf_uv$x, 
+                     y = coxlinf_uv$y,
+                     se = coxlinf_uv$se,
+                     lower_ci = cilinf_uv[,2],
+                     upper_ci = cilinf_uv[,3],
+                     mean_ci = cilinf_uv[,1])
+
+linf_univar <- linfu_df[with(linfu_df, linf_count == 282 | linf_count == 500 | linf_count == 997 | 
+              linf_count == 1507 | linf_count== 2006),] %>% 
+  mutate(hr = round(exp(y-centerlinf_uv),2),
+         upper_hr = round(exp(upper_ci-centerlinf_uv),2),
+         lower_hr = round(exp(lower_ci-centerlinf_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+linf_spline_plot <- ggplot(linfu_df, aes(x = linf_count, y = exp(mean_ci - centerlinf_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerlinf_uv)), 
+              size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerlinf_uv)), 
+              size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Total lymphocytes at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,3000,500)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,3000))
+
+
+splines_hemato_univariados <- nlymr_spline_plot+dnlr_spline_plot+plr_spline_plot+lmr_spline_plot+neu_spline_plot+
+  linf_spline_plot
+
+splines_hemato_univariados
+```
+
+
+```{r splines MULTIVARIADOS indices hematológicos, echo = F,warning = F,message=F}
+#MULTIVARIADOS CON SPLINES PARA NLYMR
+mv_nlymr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(nlymr,3) +
+                   edad + sexo + imc + diabetes + hipertension + sato2_aa, data = covid_full_4)
+
+coxnlymr_mv <- termplot(mv_nlymr, se=TRUE, plot = F)$nlymr
+centernlymr_mv <- with(coxnlymr_mv, y[x == 5])
+cinlymr_mv <- coxnlymr_mv$y + outer(coxnlymr_mv$se, c(0, -1.96, 1.96), '*')
+
+nlymrmv_df <- data.frame(nlymr_count = coxnlymr_mv$x, 
+                     y = coxnlymr_mv$y,
+                     se = coxnlymr_mv$se,
+                     lower_ci = cinlymr_mv[,2],
+                     upper_ci = cinlymr_mv[,3],
+                     mean_ci = cinlymr_mv[,1])
+
+nlymr_mv <- nlymrmv_df[with(nlymrmv_df, nlymr_count == 2.5 | nlymr_count == 5 | nlymr_count == 9.89 | 
+              nlymr_count == 15.05 |nlymr_count== 19.77),] %>% 
+  mutate(hr = round(exp(y-centernlymr_mv),2),
+         upper_hr = round(exp(upper_ci-centernlymr_mv),2),
+         lower_hr = round(exp(lower_ci-centernlymr_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+nlymr_spline_plot_mv <- ggplot(nlymrmv_df, aes(x = nlymr_count, y = exp(mean_ci - centernlymr_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centernlymr_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centernlymr_mv)), size = 1) +
+  ylab("HR of ICU admission \n or death") +
+  xlab("Neutrophil-to-lymphocyte ratio at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  scale_y_continuous(breaks = (seq(0,10,1))) +
+  scale_x_continuous(breaks = (seq(0,60,5))) +
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,30))
+
+#MULTIVARIADOS CON SPLINES PARA DNLR
+mv_dnlr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(dnlr,3) +
+                   edad + sexo + imc + diabetes + hipertension + sato2_aa, data = covid_full_4)
+ 
+coxdnlr_mv <- termplot(mv_dnlr, se=TRUE, plot = F)$dnlr
+centerdnlr_mv <- with(coxdnlr_mv, y[x == 9.99])
+cidnlr_mv <- coxdnlr_mv$y + outer(coxdnlr_mv$se, c(0, -1.96, 1.96), '*')
+
+dnlrmv_df <- data.frame(dnlr_count = coxdnlr_mv$x, 
+                     y = coxdnlr_mv$y,
+                     se = coxdnlr_mv$se,
+                     lower_ci = cidnlr_mv[,2],
+                     upper_ci = cidnlr_mv[,3],
+                     mean_ci = cidnlr_mv[,1])
+
+dnlr_mv <- dnlrmv_df[with(dnlrmv_df, dnlr_count == 1.01 | dnlr_count == 3 | dnlr_count == 4.99 | 
+              dnlr_count == 9.99 |dnlr_count== 14.87),] %>% 
+  mutate(hr = round(exp(y-centerdnlr_mv),2),
+         upper_hr = round(exp(upper_ci-centerdnlr_mv),2),
+         lower_hr = round(exp(lower_ci-centerdnlr_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+dnlr_spline_plot_mv <- ggplot(dnlrmv_df, aes(x = dnlr_count, y = exp(mean_ci - centerdnlr_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerdnlr_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerdnlr_mv)), size = 1) +
+  ylab("") +
+  xlab("Derived neutrophil index at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  scale_y_continuous(breaks = (seq(0,10,1))) +
+  scale_x_continuous(breaks = (seq(0,35,5)))+
+  coord_cartesian(ylim = c(0,10))
+
+
+#MULTIVARIADOS CON SPLINES PARA PLATELET-LYMPHOCITE RATIO (PLR)
+mv_plr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(plr,3) +
+                   edad + sexo + imc + diabetes + hipertension + sato2_aa, data = covid_full_4)
+
+coxplr_mv <- termplot(mv_plr, se=TRUE, plot = F)$plr
+centerplr_mv <- with(coxplr_mv, y[x == 180.66])
+ciplr_mv <- coxplr_mv$y + outer(coxplr_mv$se, c(0, -1.96, 1.96), '*')
+
+plrmv_df <- data.frame(plr_count = coxplr_mv$x, 
+                     y = coxplr_mv$y,
+                     se = coxplr_mv$se,
+                     lower_ci = ciplr_mv[,2],
+                     upper_ci = ciplr_mv[,3],
+                     mean_ci = ciplr_mv[,1])
+
+plr_mv <- plrmv_df[with(plru_df, plr_count == 40.17 | plr_count == 120.20 | plr_count == 180.66 | 
+              plr_count == 238.17 | plr_count== 299.04),] %>% 
+  mutate(hr = round(exp(y-centerplr_mv),2),
+         upper_hr = round(exp(upper_ci-centerplr_mv),2),
+         lower_hr = round(exp(lower_ci-centerplr_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+plr_spline_plot_mv <- ggplot(plrmv_df, aes(x = plr_count, y = exp(mean_ci - centerplr_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerplr_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerplr_mv)), size = 1) +
+  ylab("") +
+  xlab("Platelet-lymphocyte index at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1))) +
+  scale_x_continuous(breaks = (seq(0,500,50)))+
+  coord_cartesian(xlim = c(0,500),
+                  ylim = c(0,10))
+
+
+#MULTIVARIADOS CON SPLINES PARA LYMPHOCITE-MONOCYTE RATIO (LMR)
+mv_lmr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(lmr,3) +
+                   edad + sexo + imc + diabetes + hipertension + sato2_aa, data = covid_full_4)
+
+coxlmr_mv <- termplot(mv_lmr, se=TRUE, plot = F)$lmr
+centerlmr_mv <- with(coxlmr_mv, y[x == 1.5])
+cilmr_mv <- coxlmr_mv$y + outer(coxlmr_mv$se, c(0, -1.96, 1.96), '*')
+
+lmrmv_df <- data.frame(lmr_count = coxlmr_mv$x, 
+                     y = coxlmr_mv$y,
+                     se = coxlmr_mv$se,
+                     lower_ci = cilmr_mv[,2],
+                     upper_ci = cilmr_mv[,3],
+                     mean_ci = cilmr_mv[,1])
+
+lmr_mv <- lmrmv_df[with(lmrmv_df, lmr_count == 0.5 | lmr_count == 1 | lmr_count == 1.5 | 
+              lmr_count == 2 | lmr_count== 2.5),] %>% 
+  mutate(hr = round(exp(y-centerlmr_mv),2),
+         upper_hr = round(exp(upper_ci-centerlmr_mv),2),
+         lower_hr = round(exp(lower_ci-centerlmr_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+lmr_spline_plot_mv <- ggplot(lmrmv_df, aes(x = lmr_count, y = exp(mean_ci - centerlmr_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerlmr_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerlmr_mv)), size = 1) +
+  ylab("HR of ICU admission \n or death") +
+  xlab("Lymphocyte-monocyte index at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)), limits = c(0,15))+
+  scale_x_continuous(breaks = (seq(0,10,2)))+
+  coord_cartesian(ylim = c(0,10))
+
+
+#MULTIVARIADOS CON SPLINES PARA NEUTRÓFILOS TOTALES
+mv_neu <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(neutrofilos_totales,3) +
+                   edad + sexo + imc + diabetes + hipertension + sato2_aa, data = covid_full_4)
+
+coxneu_mv <- termplot(mv_neu, se=TRUE, plot = F)$neutrofilos_totales
+centerneu_mv <- with(coxneu_mv, y[x == 4998])
+cineu_mv <- coxneu_mv$y + outer(coxneu_mv$se, c(0, -1.96, 1.96), '*')
+
+neumv_df <- data.frame(neu_count = coxneu_mv$x, 
+                     y = coxneu_mv$y,
+                     se = coxneu_mv$se,
+                     lower_ci = cineu_mv[,2],
+                     upper_ci = cineu_mv[,3],
+                     mean_ci = cineu_mv[,1])
+
+neu_mv <- neumv_df[with(neumv_df, neu_count == 2027 | neu_count == 4998 | neu_count == 10008 | 
+              neu_count == 15135 | neu_count== 20281),] %>% 
+  mutate(hr = round(exp(y-centerneu_mv),2),
+         upper_hr = round(exp(upper_ci-centerneu_mv),2),
+         lower_hr = round(exp(lower_ci-centerneu_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+neu_spline_plot_mv <- ggplot(neumv_df, aes(x = neu_count, y = exp(mean_ci - centerneu_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerneu_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerneu_mv)), size = 1) +
+  ylab("") +
+  xlab("Total neutrophils at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+   scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,20000,5000)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,20000))
+
+
+#MULTIVARIADOS CON SPLINES PARA LINFOCITOS TOTALES
+mv_linf <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(linfocitos_totales,3) +
+                   edad + sexo + imc + diabetes + hipertension + sato2_aa, data = covid_full_4)
+
+coxlinf_mv <- termplot(mv_linf, se=TRUE, plot = F)$linfocitos_totales
+centerlinf_mv <- with(coxlinf_mv, y[x == 997])
+cilinf_mv <- coxlinf_mv$y + outer(coxlinf_mv$se, c(0, -1.96, 1.96), '*')
+
+linfmv_df <- data.frame(linf_count = coxlinf_mv$x, 
+                     y = coxlinf_mv$y,
+                     se = coxlinf_mv$se,
+                     lower_ci = cilinf_mv[,2],
+                     upper_ci = cilinf_mv[,3],
+                     mean_ci = cilinf_mv[,1])
+
+linf_mv <- linfmv_df[with(linfmv_df, linf_count == 282 | linf_count == 500 | linf_count == 997 | 
+              linf_count == 1507 | linf_count== 2006),] %>% 
+  mutate(hr = round(exp(y-centerlinf_mv),2),
+         upper_hr = round(exp(upper_ci-centerlinf_mv),2),
+         lower_hr = round(exp(lower_ci-centerlinf_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+linf_spline_plot_mv <- ggplot(linfmv_df, aes(x = linf_count, y = exp(mean_ci - centerlinf_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerlinf_mv)), 
+              size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerlinf_mv)), 
+              size = 1) +
+  ylab("") +
+  xlab("Total lymphocites at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,3000,500)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,3000))
+
+
+
+splines_hemato_multivariados <- nlymr_spline_plot_mv+dnlr_spline_plot_mv+plr_spline_plot_mv+lmr_spline_plot_mv+
+  neu_spline_plot_mv+linf_spline_plot_mv
+ 
+
+splines_hemato_multivariados
+```
+
+En esta el producto final son las gráficas de los ajustes por splines para los marcadores inflamatorios en general. 
+```{r splines UNIVARIADOS cpk-dhl-ferritina-pcr-dimeroD-troponina, echo = F,warning = F,message=F}
+#UNIVARIADOS CON SPLINES PARA NLYMR
+#fivenum(covid_full_4$cpk_ingreso)
+#boxplot(covid_full_4$cpk_ingreso)
+
+uni_cpk <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(cpk_ingreso,3), data = covid_full_4)
+
+coxcpk_uv <- termplot(uni_cpk, se=TRUE, plot = F)$cpk_ingreso
+centercpk_uv <- with(coxcpk_uv, y[x == 101])
+cicpk_uv <- coxcpk_uv$y + outer(coxcpk_uv$se, c(0, -1.96, 1.96), '*')
+
+cpku_df <- data.frame(cpk_count = coxcpk_uv$x, 
+                     y = coxcpk_uv$y,
+                     se = coxcpk_uv$se,
+                     lower_ci = cicpk_uv[,2],
+                     upper_ci = cicpk_uv[,3],
+                     mean_ci = cicpk_uv[,1])
+
+cpk_univar <- cpku_df[with(cpku_df, cpk_count == 19 | cpk_count == 60 | cpk_count == 101 | 
+              cpk_count == 201 | cpk_count== 500),] %>% 
+  mutate(hr = round(exp(y-centercpk_uv),2),
+         upper_hr = round(exp(upper_ci-centercpk_uv),2),
+         lower_hr = round(exp(lower_ci-centercpk_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+cpk_spline_plot <- ggplot(cpku_df, aes(x = cpk_count, y = exp(mean_ci - centercpk_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centercpk_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centercpk_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Creatine phosphokinase at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  scale_y_continuous(breaks = (seq(0,10,1))) +
+  scale_x_continuous(breaks = (seq(0,1500,300))) +
+  coord_cartesian(ylim = c(0, 10),
+                  xlim = c(0, 1500)) 
+
+#UNIVARIADOS CON SPLINES PARA DHL#######PROBABLEMENTE DHL PUEDA SER AJUSTADA A UN MODELO LINEAR
+#fivenum(covid_full_4$dhl_ingreso)
+#boxplot(covid_full_4$dhl_ingreso)
+
+uni_dhl <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(dhl_ingreso,3), data = covid_full_4)
+
+coxdhl_uv <- termplot(uni_dhl, se=TRUE, plot = F)$dhl
+centerdhl_uv <- with(coxdhl_uv, y[x == 350])
+cidhl_uv <- coxdhl_uv$y + outer(coxdhl_uv$se, c(0, -1.96, 1.96), '*')
+
+dhlu_df <- data.frame(dhl_count = coxdhl_uv$x, 
+                     y = coxdhl_uv$y,
+                     se = coxdhl_uv$se,
+                     lower_ci = cidhl_uv[,2],
+                     upper_ci = cidhl_uv[,3],
+                     mean_ci = cidhl_uv[,1])
+
+
+
+dhl_univar <- dhlu_df[with(dhlu_df, dhl_count == 148 | dhl_count == 250 | dhl_count == 350 | 
+              dhl_count == 499 | dhl_count == 703),] %>% 
+  mutate(hr = round(exp(y-centerdhl_uv),2),
+         upper_hr = round(exp(upper_ci-centerdhl_uv),2),
+         lower_hr = round(exp(lower_ci-centerdhl_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+dhl_spline_plot <- ggplot(dhlu_df, aes(x = dhl_count, y = exp(mean_ci - centerdhl_uv))) +
+  geom_hline(yintercept = c(1,3,5,7,9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerdhl_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerdhl_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Lactate dehydrogenase at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  coord_cartesian(xlim = c(0, 1000),
+                  ylim = c(0,10)) +
+  scale_x_continuous(breaks = seq(0,1000,100))+
+  scale_y_continuous(breaks = seq(0,10,1))
+
+
+#UNIVARIADOS CON SPLINES PARA FERRITINA, por lo pronto voy a retirar los valores demasiado grandes ( y unos que al parecer están negativos)
+#filter(covid_full_4, ferritina_ingreso >2000) Hay 6 pacientes con la ferritina arriba de 3000, de manera que por lo pronto se van a excluir
+#fivenum(covid_full_4$ferritina_ingreso)
+#boxplot(covid_full_4$ferritina_ingreso)
+
+uni_ferr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(ferritina_ingreso,3), data = filter(covid_full_4, ferritina_ingreso <=3000))
+
+coxferr_uv <- termplot(uni_ferr, se=TRUE, plot = F)$ferritina_ingreso
+centerferr_uv <- with(coxferr_uv, y[x == 501])
+ciferr_uv <- coxferr_uv$y + outer(coxferr_uv$se, c(0, -1.96, 1.96), '*')
+
+ferru_df <- data.frame(ferr_count = coxferr_uv$x, 
+                     y = coxferr_uv$y,
+                     se = coxferr_uv$se,
+                     lower_ci = ciferr_uv[,2],
+                     upper_ci = ciferr_uv[,3],
+                     mean_ci = ciferr_uv[,1])
+
+ferr_univar <- ferru_df[with(ferru_df, ferr_count == 97 | ferr_count == 199.3 | ferr_count == 395.4 | 
+              ferr_count == 501 | ferr_count== 1002.5),] %>% 
+  mutate(hr = round(exp(y-centerferr_uv),2),
+         upper_hr = round(exp(upper_ci-centerferr_uv),2),
+         lower_hr = round(exp(lower_ci-centerferr_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+ferr_spline_plot <- ggplot(ferru_df, aes(x = ferr_count, y = exp(mean_ci - centerferr_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerferr_uv)), 
+              size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerferr_uv)), 
+              size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Ferritin at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,2500,250)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,1500))
+
+
+#UNIVARIADOS CON SPLINES PARA PCR
+#fivenum(covid_full_4$pcr_ingreso)
+#boxplot(covid_full_4$pcr_ingreso)
+
+uni_pcr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(pcr_ingreso,3), data = covid_full_4)
+
+coxpcr_uv <- termplot(uni_pcr, se=TRUE, plot = F)$pcr_ingreso
+centerpcr_uv <- with(coxpcr_uv, y[x == 10.04])
+cipcr_uv <- coxpcr_uv$y + outer(coxpcr_uv$se, c(0, -1.96, 1.96), '*')
+
+pcru_df <- data.frame(pcr_count = coxpcr_uv$x, 
+                     y = coxpcr_uv$y,
+                     se = coxpcr_uv$se,
+                     lower_ci = cipcr_uv[,2],
+                     upper_ci = cipcr_uv[,3],
+                     mean_ci = cipcr_uv[,1])
+
+pcr_univar <- pcru_df[with(pcru_df, pcr_count == 0.5 | pcr_count == 0.94 | pcr_count == 5.04 | 
+              pcr_count == 10.03 | pcr_count== 15.02),] %>% 
+  mutate(hr = round(exp(y-centerpcr_uv),2),
+         upper_hr = round(exp(upper_ci-centerpcr_uv),2),
+         lower_hr = round(exp(lower_ci-centerpcr_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+pcr_spline_plot <- ggplot(pcru_df, aes(x = pcr_count, y = exp(mean_ci - centerpcr_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerpcr_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerpcr_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("C-reactive protein at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,30,2.5)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,20))
+
+
+#UNIVARIADOS CON SPLINES PARA DÍMERO D, al parecer solo 3 tienen valores arriba de 10000, por lo pronto veremos como se comporta con estos valores pero probablemente los quite porque el intervalo será demasiado ancho
+#fivenum(covid_full_4$dimerod_ingreso)
+#boxplot(covid_full_4$dimerod_ingreso)
+
+uni_dd <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(dimerod_ingreso,3), data = filter(covid_full_4, dimerod_ingreso <5000))
+
+coxdd_uv <- termplot(uni_dd, se=TRUE, plot = F)$dimerod_ingreso
+centerdd_uv <- with(coxdd_uv, y[x == 499])
+cidd_uv <- coxdd_uv$y + outer(coxdd_uv$se, c(0, -1.96, 1.96), '*')
+
+ddu_df <- data.frame(dd_count = coxdd_uv$x, 
+                     y = coxdd_uv$y,
+                     se = coxdd_uv$se,
+                     lower_ci = cidd_uv[,2],
+                     upper_ci = cidd_uv[,3],
+                     mean_ci = cidd_uv[,1])
+
+dd_univar <- ddu_df[with(ddu_df, dd_count == 209 | dd_count == 499 | dd_count == 1007 | 
+              dd_count == 1466 | dd_count== 2531),] %>% 
+  mutate(hr = round(exp(y-centerdd_uv),2),
+         upper_hr = round(exp(upper_ci-centerdd_uv),2),
+         lower_hr = round(exp(lower_ci-centerdd_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+dd_spline_plot <- ggplot(ddu_df, aes(x = dd_count, y = exp(mean_ci - centerdd_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerdd_uv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerdd_uv)), size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("D-dimer at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,5000,500)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,3000))
+
+#UNIVARIADOS CON SPLINES PARA TROPONINA I
+#fivenum(covid_full_4$dimerod_ingreso)
+#boxplot(covid_full_4$dimerod_ingreso)
+
+uni_trop <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(troponina_ingreso,3), data = covid_full_4)
+
+coxtrop_uv <- termplot(uni_trop, se=TRUE, plot = F)$troponina_ingreso
+centertrop_uv <- with(coxtrop_uv, y[x == 5])
+citrop_uv <- coxtrop_uv$y + outer(coxtrop_uv$se, c(0, -1.96, 1.96), '*')
+
+tropu_df <- data.frame(trop_count = coxtrop_uv$x, 
+                     y = coxtrop_uv$y,
+                     se = coxtrop_uv$se,
+                     lower_ci = citrop_uv[,2],
+                     upper_ci = citrop_uv[,3],
+                     mean_ci = citrop_uv[,1])
+
+trop_univar <- tropu_df[with(tropu_df, trop_count == 2 | trop_count == 5 | trop_count == 10 | 
+              trop_count == 15 | trop_count== 20.04),] %>% 
+  mutate(hr = round(exp(y-centertrop_uv),2),
+         upper_hr = round(exp(upper_ci-centertrop_uv),2),
+         lower_hr = round(exp(lower_ci-centertrop_uv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+trop_spline_plot <- ggplot(tropu_df, aes(x = trop_count, y = exp(mean_ci - centertrop_uv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centertrop_uv)), 
+              size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centertrop_uv)), 
+              size = 1) +
+  ylab("HR of ICU admission or death") +
+  xlab("Troponin I at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,100,5)))+
+  coord_cartesian(ylim =c(0,10),
+                  xlim = c(0,50))
+
+
+splines_univariado <- dd_spline_plot+ferr_spline_plot+dhl_spline_plot+pcr_spline_plot+cpk_spline_plot+trop_spline_plot
+
+splines_univariado
+```
+
+```{r splines MULTIVARIADOS cpk-dhl-ferritina-pcr-dimeroD, echo = F,warning = F,message=F}
+#MULTIVARIADOS CON SPLINES PARA NLYMR
+#fivenum(covid_full_4$cpk_ingreso)
+#boxplot(covid_full_4$cpk_ingreso)
+
+mv_cpk <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(cpk_ingreso,3) +
+                   edad + sexo + imc + diabetes + hipertension + sato2_aa, data = covid_full_4)
+
+coxcpk_mv <- termplot(mv_cpk, se=TRUE, plot = F)$cpk_ingreso
+centercpk_mv <- with(coxcpk_mv, y[x == 101])
+cicpk_mv <- coxcpk_mv$y + outer(coxcpk_mv$se, c(0, -1.96, 1.96), '*')
+
+cpkmv_df <- data.frame(cpk_count = coxcpk_mv$x, 
+                     y = coxcpk_mv$y,
+                     se = coxcpk_mv$se,
+                     lower_ci = cicpk_mv[,2],
+                     upper_ci = cicpk_mv[,3],
+                     mean_ci = cicpk_mv[,1])
+
+cpk_mv <- cpkmv_df[with(cpkmv_df, cpk_count == 19 | cpk_count == 60 | cpk_count == 101 | 
+              cpk_count == 201 | cpk_count== 500),] %>% 
+  mutate(hr = round(exp(y-centercpk_mv),2),
+         upper_hr = round(exp(upper_ci-centercpk_mv),2),
+         lower_hr = round(exp(lower_ci-centercpk_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+cpk_spline_plot_mv <- ggplot(cpkmv_df, aes(x = cpk_count, y = exp(mean_ci - centercpk_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centercpk_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centercpk_mv)), size = 1) +
+  ylab("HR of ICU admission \n or death") +
+  xlab("Creatine phosphokinase at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  scale_y_continuous(breaks = (seq(0,10,1)), limits = c(0,10)) +
+  scale_x_continuous(breaks = (seq(0,1500,300)), limits = c(0,1500)) 
+
+#MULTIVARIADOS CON SPLINES PARA DHL#######PROBABLEMENTE DHL PUEDA SER AJUSTADA A UN MODELO LINEAR
+#fivenum(covid_full_4$dhl_ingreso)
+#boxplot(covid_full_4$dhl_ingreso)
+
+mv_dhl <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(dhl_ingreso,3) +
+                   edad + sexo + imc + diabetes + hipertension + sato2_aa, data = covid_full_4)
+
+coxdhl_mv <- termplot(uni_dhl, se=TRUE, plot = F)$dhl
+centerdhl_mv <- with(coxdhl_mv, y[x == 350])
+cidhl_mv <- coxdhl_mv$y + outer(coxdhl_mv$se, c(0, -1.96, 1.96), '*')
+
+dhlmv_df <- data.frame(dhl_count = coxdhl_mv$x, 
+                     y = coxdhl_mv$y,
+                     se = coxdhl_mv$se,
+                     lower_ci = cidhl_mv[,2],
+                     upper_ci = cidhl_mv[,3],
+                     mean_ci = cidhl_mv[,1])
+
+dhl_mv <- dhlmv_df[with(dhlmv_df, dhl_count == 148 | dhl_count == 250 | dhl_count == 350 | 
+              dhl_count == 499 | dhl_count == 703),] %>% 
+  mutate(hr = round(exp(y-centerdhl_mv),2),
+         upper_hr = round(exp(upper_ci-centerdhl_mv),2),
+         lower_hr = round(exp(lower_ci-centerdhl_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+dhl_spline_plot_mv <- ggplot(dhlu_df, aes(x = dhl_count, y = exp(mean_ci - centerdhl_mv))) +
+  geom_hline(yintercept = c(1,3,5,7,9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerdhl_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerdhl_mv)), size = 1) +
+  ylab("") +
+  xlab("Lactate dehydrogenase at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  coord_cartesian(xlim = c(0, 1000),
+                  ylim = c(0,10)) +
+  scale_x_continuous(breaks = seq(0,1000,100))+
+  scale_y_continuous(breaks = seq(0,10,1))
+
+
+#MULTIVARIADOS CON SPLINES PARA FERRITINA, por lo pronto voy a retirar los valores demasiado grandes ( y unos que al parecer están negativos)
+#filter(covid_full_4, ferritina_ingreso >2000) Hay 6 pacientes con la ferritina arriba de 3000, de manera que por lo pronto se van a excluir
+#fivenum(covid_full_4$ferritina_ingreso)
+#boxplot(covid_full_4$ferritina_ingreso)
+
+mv_ferr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(ferritina_ingreso,3) +
+                    edad + sexo + imc + diabetes + hipertension + sato2_aa, 
+                  data =  filter(covid_full_4, ferritina_ingreso <=3000))
+
+
+coxferr_mv <- termplot(mv_ferr, se=TRUE, plot = F)$ferritina_ingreso
+centerferr_mv <- with(coxferr_mv, y[x == 501])
+ciferr_mv <- coxferr_mv$y + outer(coxferr_mv$se, c(0, -1.96, 1.96), '*')
+
+ferrmv_df <- data.frame(ferr_count = coxferr_mv$x, 
+                     y = coxferr_mv$y,
+                     se = coxferr_mv$se,
+                     lower_ci = ciferr_mv[,2],
+                     upper_ci = ciferr_mv[,3],
+                     mean_ci = ciferr_mv[,1])
+
+ferr_mv <- ferrmv_df[with(ferrmv_df, ferr_count == 97 | ferr_count == 199.3 | ferr_count == 395.4 | 
+              ferr_count == 501 | ferr_count== 1002.5),] %>% 
+  mutate(hr = round(exp(y-centerferr_mv),2),
+         upper_hr = round(exp(upper_ci-centerferr_mv),2),
+         lower_hr = round(exp(lower_ci-centerferr_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+ferr_spline_plot_mv <- ggplot(ferrmv_df, aes(x = ferr_count, y = exp(mean_ci - centerferr_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerferr_mv)), 
+              size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerferr_mv)), 
+              size = 1) +
+  ylab("") +
+  xlab("Ferritin at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,2500,250)))+
+  coord_cartesian(xlim = c(0, 1000),
+                  ylim = c(0,10))
+
+
+#MULTIVARIADOS CON SPLINES PARA PCR
+#fivenum(covid_full_4$pcr_ingreso)
+#boxplot(covid_full_4$pcr_ingreso)
+
+mv_pcr <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(ferritina_ingreso,3) +
+                    edad + sexo + imc + diabetes + hipertension + sato2_aa, 
+                  data =  covid_full_4)
+
+coxpcr_mv <- termplot(uni_pcr, se=TRUE, plot = F)$pcr_ingreso
+centerpcr_mv <- with(coxpcr_mv, y[x == 10.04])
+cipcr_mv <- coxpcr_mv$y + outer(coxpcr_mv$se, c(0, -1.96, 1.96), '*')
+
+pcrmv_df <- data.frame(pcr_count = coxpcr_mv$x, 
+                     y = coxpcr_mv$y,
+                     se = coxpcr_mv$se,
+                     lower_ci = cipcr_mv[,2],
+                     upper_ci = cipcr_mv[,3],
+                     mean_ci = cipcr_mv[,1])
+
+pcr_mv <- pcrmv_df[with(pcrmv_df, pcr_count == 0.5 | pcr_count == 1.07 | pcr_count == 5.04 | 
+              pcr_count == 10.03 | pcr_count== 15.02),] %>% 
+  mutate(hr = round(exp(y-centerpcr_mv),2),
+         upper_hr = round(exp(upper_ci-centerpcr_mv),2),
+         lower_hr = round(exp(lower_ci-centerpcr_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+pcr_spline_plot_mv <- ggplot(pcrmv_df, aes(x = pcr_count, y = exp(mean_ci - centerpcr_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerpcr_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerpcr_mv)), size = 1) +
+  ylab("HR of ICU admission \n or death") +
+  xlab("C-reactive protein at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+ scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,30,2.5)))+
+  coord_cartesian(ylim = c(0,10),
+                  xlim = c(0,20))
+
+
+#MULTIVARIADOS CON SPLINES PARA DÍMERO D, al parecer solo 3 tienen valores arriba de 10000, por lo pronto veremos como se comporta con estos valores pero probablemente los quite porque el intervalo será demasiado ancho
+#fivenum(covid_full_4$dimerod_ingreso)
+#boxplot(covid_full_4$dimerod_ingreso)
+
+mv_dd <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(dimerod_ingreso,3) +
+                    edad + sexo + imc + diabetes + hipertension + sato2_aa, 
+                  data = filter(covid_full_4, dimerod_ingreso <5000))
+
+coxdd_mv <- termplot(mv_dd, se=TRUE, plot = F)$dimerod_ingreso
+centerdd_mv <- with(coxdd_mv, y[x == 499])
+cidd_mv <- coxdd_mv$y + outer(coxdd_mv$se, c(0, -1.96, 1.96), '*')
+
+ddmv_df <- data.frame(dd_count = coxdd_mv$x, 
+                     y = coxdd_mv$y,
+                     se = coxdd_mv$se,
+                     lower_ci = cidd_mv[,2],
+                     upper_ci = cidd_mv[,3],
+                     mean_ci = cidd_mv[,1])
+
+dd_mv <- ddmv_df[with(ddmv_df, dd_count == 209 | dd_count == 499 | dd_count == 1007 | 
+              dd_count == 1466 | dd_count== 2531),] %>% 
+  mutate(hr = round(exp(y-centerdd_mv),2),
+         upper_hr = round(exp(upper_ci-centerdd_mv),2),
+         lower_hr = round(exp(lower_ci-centerdd_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+dd_spline_plot_mv <- ggplot(ddmv_df, aes(x = dd_count, y = exp(mean_ci - centerdd_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centerdd_mv)), size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centerdd_mv)), size = 1) +
+  ylab("HR of ICU admission \n or death") +
+  xlab("D-dimer at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,5000,500)))+
+  coord_cartesian(ylim =c(0,10),
+                  xlim = c(0,3000))
+
+#MULTIVARIADO PARA TROPONINA I 
+mv_trop <- coxph(Surv(sobrevida_primer_evento, desenlace_uti == 1) ~ rcs(troponina_ingreso,3) +
+                    edad + sexo + imc + diabetes + hipertension + sato2_aa, 
+                  data = covid_full_4)
+
+coxtrop_mv <- termplot(mv_trop, se=TRUE, plot = F)$troponina_ingreso
+centertrop_mv <- with(coxtrop_mv, y[x == 5])
+citrop_mv <- coxtrop_mv$y + outer(coxtrop_mv$se, c(0, -1.96, 1.96), '*')
+
+tropmv_df <- data.frame(trop_count = coxtrop_mv$x, 
+                     y = coxtrop_mv$y,
+                     se = coxtrop_mv$se,
+                     lower_ci = citrop_mv[,2],
+                     upper_ci = citrop_mv[,3],
+                     mean_ci = citrop_mv[,1])
+
+trop_mv <- tropmv_df[with(tropmv_df, trop_count == 2 | trop_count == 5 | trop_count == 10 | 
+              trop_count == 15 | trop_count== 20.04),] %>% 
+  mutate(hr = round(exp(y-centertrop_mv),2),
+         upper_hr = round(exp(upper_ci-centertrop_mv),2),
+         lower_hr = round(exp(lower_ci-centertrop_mv),2),
+         full_ci = str_c(lower_hr, "-",upper_hr))
+
+trop_spline_plot_mv <- ggplot(tropmv_df, aes(x = trop_count, y = exp(mean_ci - centertrop_mv))) +
+  geom_hline(yintercept = c(1, 3, 5, 7, 9), colour = "gray") +
+  geom_smooth(se = F, colour = "red") +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(upper_ci - centertrop_mv)), 
+              size = 1) +
+  geom_smooth(se = F, colour = "red", linetype = "dashed", aes(y = exp(lower_ci - centertrop_mv)), 
+              size = 1) +
+  ylab("") +
+  xlab("Troponin I at admission")+
+  theme_light()+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+   scale_y_continuous(breaks = (seq(0,10,1)))+
+  scale_x_continuous(breaks = (seq(0,100,5)))+
+  coord_cartesian(ylim =c(0,10),
+                  xlim = c(0,50))
+
+
+
+
+
+splines_multivariated <- (nlymr_spline_plot_mv | dnlr_spline_plot_mv | plr_spline_plot_mv) /
+  (lmr_spline_plot_mv | neu_spline_plot_mv  | linf_spline_plot_mv) /
+  (dd_spline_plot_mv | ferr_spline_plot_mv | dhl_spline_plot_mv) / 
+  (pcr_spline_plot_mv | cpk_spline_plot_mv | trop_spline_plot_mv)
+
+
+splines_multivariated 
+
+
+
+```
+
+
+La idea hasta ahora es incluir cinco columnas en la tabla:</br>
+1-Nombres de las variables</br>
+2-Valores de la base en general</br>
+3-Valores de los que NO ingresaron a UCI</br>
+4-Valores de los que SI ingresaron a UCI</br>
+5-Diferencias estandarizadas</br>
+
+Podría ser conveniente también incluir una columna para los que se murieron sin entrar a la UCI
+```{r Primeras funciones de la tabla,  warning = F, include = F,message=F}
+#vectores a incluir en la tabla
+#RECORDAR QUE LA BASE ES covid_full_4
+generalisimo <- function(x){
+  c(n_distinct(x[,1]),  
+    round(median(x$sobrevida_primer_evento,1)),
+    NA, 
+    sum(x$sexo == "m"), 
+    median(x$edad, na.rm = T),
+    median(x$imc, na.rm = T),
+    sum(x$diabetes, na.rm = T), 
+    sum(x$hipertension, na.rm = T),
+    NA,
+    sum(x$disnea, na.rm = T),
+    sum(x$fiebre, na.rm = T),
+    sum(x$tos, na.rm = T),
+    sum(x$dolor_toracico, na.rm = T),
+    sum(x$cefalea, na.rm = T),
+    sum(x$mialgias, na.rm = T),
+    sum(x$diarrea, na.rm = T),
+    NA, 
+    median(x$fc, na.rm = T), 
+    median(x$fr, na.rm = T), 
+    median(x$temperatura, na.rm = T), 
+    median(x$ta_sist, na.rm = T), 
+    median(x$ta_diast, na.rm = T), 
+    median(x$pam, na.rm = T), 
+    NA, 
+    median(x$psi_port_clase, na.rm = T), 
+    median(x$curb65, na.rm = T),
+    median(x$q_sofa, na.rm = T),
+    median(x$news, na.rm = T),
+    NA, 
+    median(x$hb_ingreso, na.rm = T),
+    median(x$plaquetas_ingreso, na.rm = T),
+    median(x$leucocitos_ingreso, na.rm = T),
+    median(x$neutrofilos_totales, na.rm = T),
+    median(x$linfocitos_totales, na.rm = T),
+    median(x$monocitos_totales, na.rm = T),
+    median(x$nlymr, na.rm = T),
+    median(x$dnlr, na.rm = T),
+    median(x$plr, na.rm = T),
+    median(x$lmr, na.rm = T),
+    NA,
+    median(x$pcr_ingreso, na.rm = T),
+    median(x$ferritina_ingreso, na.rm = T),
+    median(x$dimerod_ingreso, na.rm = T),
+    median(x$dhl_ingreso, na.rm = T),
+    median(x$cpk_ingreso, na.rm = T),
+    median(x$fibrinogeno_ingreso, na.rm = T),
+    median(x$troponina_ingreso, na.rm = T),
+    NA,
+    median(x$sato2_aa, na.rm = T),
+    median(x$pa02_ingreso, na.rm = T),
+    median(x$paco2_ingreso, na.rm = T),
+    median(x$sat02_gaso_ingreso, na.rm = T))
+}
+```
+
+En el siguiente chunk coloco las funciones de:</br>
+-Porcentajes (para las variables categóricas)</br>
+-Diferencias estandarizadas (para la última columna)</br>
+
+```{r funciones para la tabla 1, include = F,message=F}
+#Función de porcentajes
+porcentajes <- function(x,y){
+  if(is.logical(unlist(covid_full_4[,x]))){
+    str_c("(",round(sum(y[,x]==T, na.rm = T)/nrow(y)*100,1),"%",")")
+  }else{
+          str_c(" ","(", fivenum(unlist(y[,x]), na.rm = T)[2], "-", 
+                fivenum(unlist(y[,x]), na.rm = T)[4], ")")
+}
+}
+
+
+#Función de diferencias estandarizadas
+#YA HAY UN PAQUETE DE DIFERENCIAS ESTANDARIZADAS, stddiff. INtegraré sus funciones en esta
+dif_estand <-function(x){
+  if_else(is.logical(x),
+    str_c(stddiff.binary(as.data.frame(covid_full_4), gcol = which(colnames(covid_full_4)=="desenlace_uti"), 
+                         vcol = which(colnames(covid_full_4)==x))[7], " (", 
+          stddiff.binary(as.data.frame(covid_full_4),
+                          gcol = which(colnames(covid_full_4)=="desenlace_uti"), vcol = which(colnames(covid_full_4)==x))[8],
+          "-",
+          stddiff.binary(as.data.frame(covid_full_4),
+                          gcol = which(colnames(covid_full_4)=="desenlace_uti"), vcol = which(colnames(covid_full_4)==x))[9],
+          ")"),
+    str_c(stddiff.numeric(as.data.frame(covid_full_4), gcol = which(colnames(covid_full_4)=="desenlace_uti"), 
+                         vcol = which(colnames(covid_full_4)==x))[7], " (",
+          stddiff.numeric(as.data.frame(covid_full_4),
+                          gcol = which(colnames(covid_full_4)=="desenlace_uti"), 
+                          vcol = which(colnames(covid_full_4)==x))[8],
+          "-",
+          stddiff.numeric(as.data.frame(covid_full_4),
+                          gcol = which(colnames(covid_full_4)=="desenlace_uti"), 
+                          vcol = which(colnames(covid_full_4)==x))[9],")"))
+} 
+
+
+#Función PARA P VALORES
+p_val <-function(x){
+  if_else(is.logical(covid_full_4[[x]]),
+          if_else(chisq.test(covid_full_4$desenlace_uti, covid_full_4[[x]])$p.value
+                <0.001, "<0.001 chisq", str_c(round(chisq.test(covid_full_4$desenlace_uti, covid_full_4[[x]])$p.value,3), " chisq")),
+          if_else(t.test(covid_full_4$desenlace_uti, covid_full_4[[x]])$p.value<0.001,
+                        "<0.001 t test", str_c(round(t.test(covid_full_4$desenlace_uti, covid_full_4[[x]])$p.value,3), " t test")))
+  }
+
+#Este es el valor para la diferencia de sobrevidas, no el valor que aparecerá posteriormente 
+Median.test(as.numeric(covid_full_4$sobrevida_primer_evento[!is.na(covid_full_4$sobrevida_primer_evento)]), 
+            as.numeric(covid_full_4$desenlace_uti[!is.na(covid_full_4$sobrevida_primer_evento)]))$statistics[[2]]
+
+
+variables <- c("N", "Mediana de tiempo de sobrevida", "Características generales", "Mujeres","Edad", "IMC", "Diabetes", "Hipertensión", "Síntomas", "Disnea", "Fiebre", "Tos", "Dolor torácico","Cefalea", "Mialgias", "Diarrea", "Signos vitales", "FC","FR", "Temperatura", "TA sist","Ta diast", "PAM", "Escalas de severidad","PSI port", "CURB65", "qSOFA", "NEWS", "BH de ingreso", "HB", "Plaquetas", "Leucos totales", "Neutros", "Linfos", "Monocitos", "Índice neutro-linfo", "Índice neutro-derivado", "Índice plaqueta-linfo", "Índice linfo-mono", "Marcadores inflamatorios al ingreso", "PCR", "Ferritina", "Dímero D", "DHL", "CPK", "Fibrinógeno", "Troponina I", "GASA de ingreso", "SatO2 AA", "PaO2", "PaCO2", "SatO2 en gaso")
+
+variables_p <-c(NA, "sobrevida_primer_evento", NA, "mujer", "edad", "imc", "diabetes" , "hipertension", 
+                NA, "disnea", "fiebre", "tos", "dolor_toracico", "cefalea", "mialgias", "diarrea", NA, 
+                "fc", "fr", "temperatura","ta_sist", "ta_diast", "pam", NA, "psi_port_clase", "curb65", "q_sofa", "news",
+                NA, "hb_ingreso", "plaquetas_ingreso", "leucocitos_ingreso", "neutrofilos_totales",
+                "linfocitos_totales","monocitos_totales", "nlymr", "dnlr", "plr", "lmr",  NA, "pcr_ingreso",
+                "ferritina_ingreso","dimerod_ingreso", "dhl_ingreso", "cpk_ingreso", "fibrinogeno_ingreso",
+                "troponina_ingreso", NA,"sato2_aa", "pa02_ingreso", "paco2_ingreso", "sat02_gaso_ingreso")
+
+#length(variables)== length(variables_p) correcto
+
+porcentajes_iqr_gral <- variables_p
+porcentajes_iqr_uti <- variables_p
+porcentajes_iqr_nouti <- variables_p
+p_valores_tabla_1 <- variables_p
+
+#Aquí asigno los p valores
+for(i in seq_along(variables_p)){
+  p_valores_tabla_1[i] <- ifelse(!is.na(variables_p[i]), p_val(variables_p[i]), NA)
+}
+
+
+#Aquí asigno las diferencias estandarizadas y los porcentajes/IQRs según la columna deseada
+for(i in 1:length(variables_p)){
+   porcentajes_iqr_gral[i] <- ifelse(is.na(variables_p[i]),NA, porcentajes(x=variables_p[i],y=covid_full_4))
+}
+
+for(i in 1:length(variables_p)){
+   porcentajes_iqr_uti[i] <- ifelse(is.na(variables_p[i]),NA, porcentajes(x=variables_p[i], 
+                                                                          y = filter(covid_full_4, desenlace_uti == T)))
+}
+
+for(i in 1:length(variables_p)){
+   porcentajes_iqr_nouti[i] <- ifelse(is.na(variables_p[i]),NA, porcentajes(x=variables_p[i],
+                                                                            y=filter(covid_full_4, desenlace_uti == F)))
+}
+
+
+
+diferencias_estandarizadas <- variables_p
+
+#Aquí asigno las diferencias estandarizadas 
+for(i in seq_along(variables_p)){
+   diferencias_estandarizadas[i] <- ifelse(!is.na(variables_p[i]), dif_estand(variables_p[i]), NA)
+}
+
+
+#PRUEBA T DE STUDENT Y CHI CUADRADA
+for(i in 1:length(variables_p)){
+   porcentajes_iqr_gral[i] <- ifelse(is.na(variables_p[i]),NA, porcentajes(x=variables_p[i],y=covid_full_4))
+}
+
+for(i in 1:length(variables_p)){
+   porcentajes_iqr_uti[i] <- ifelse(is.na(variables_p[i]),NA, porcentajes(x=variables_p[i], 
+                                                                          y = filter(covid_full_4, desenlace_uti == T)))
+}
+
+for(i in 1:length(variables_p)){
+   porcentajes_iqr_nouti[i] <- ifelse(is.na(variables_p[i]),NA, porcentajes(x=variables_p[i],
+                                                                            y=filter(covid_full_4, desenlace_uti == F)))
+}
+
+
+
+diferencias_estandarizadas <- variables_p
+
+#Aquí asigno las diferencias estandarizadas 
+for(i in seq_along(variables_p)){
+   diferencias_estandarizadas[i] <- ifelse(!is.na(variables_p[i]), dif_estand(variables_p[i]), NA)
+}
+
+
+```
+
+Impresión de la tabla 1
+```{r Tabla 1, echo = F, warning=F,message=F}
+tabla_1_df <- data.frame(Variable = variables,
+                         'Toda la cohorte' = str_c(generalisimo(covid_full_4)," ", porcentajes_iqr_gral),   
+                         'No ingresaron a UTI' = str_c(generalisimo(covid_full_4 %>% filter(desenlace_uti == F)),
+                                                       " ", porcentajes_iqr_nouti),
+                         'Ingresaron a UTI' = str_c(generalisimo(covid_full_4 %>% filter(desenlace_uti == T)),
+                                                    " ", porcentajes_iqr_uti),
+                         'Diferencias_estandarizadas' = diferencias_estandarizadas,
+                         'p_valores' = p_valores_tabla_1)
+
+
+View(tabla_1_df)
+tabla_1 <- autofit(flextable(tabla_1_df))
+```
+
+
+```{r Tabla 2, echo  = F,warning=F,message=F}
+variables_tabla_2 <- c("Índice neutro-linfo", c(2.5, 5, 10, 15, 20), NA,
+                       "Índice neutro-derivado", c(1,3,5,10,15),NA,
+                       "Índice plaqueta-linfo", c(40,120,180,240,300),NA,
+                       "Índice linfo-mono", c(seq(0.5,2.5,.5)), NA,
+                       "Neutrófilos totales", c(2000, 5000, 10000, 15000, 20000), NA,
+                       "Linfocitos totales", c(300, 500, 1000, 1500, 2000), NA,
+                       "CPK", c(20, 60, 100, 200, 500), NA,
+                       "DHL", c(150, 250, 350, 500, 700), NA, 
+                       "Ferritina", c(100, 200, 400, 500, 1000), NA,
+                       "PCR", c(0.5, 1, 5, 10, 15), NA,
+                       "Dímero D", c(200, 500, 1000, 1500, 2500), NA,
+                       "Troponina I", c(2, 5, 10, 15, 20))
+
+
+univariados <- c(NA, str_c(nlymr_univar$hr, " (", nlymr_univar$full_ci, ")"), NA,
+                 NA, str_c(dnlr_univar$hr, " (", dnlr_univar$full_ci, ")"), NA,
+                 NA, str_c(plr_univar$hr, " (", plr_univar$full_ci, ")"), NA,
+                 NA, str_c(lmr_univar$hr, " (", lmr_univar$full_ci, ")"), NA,
+                 NA, str_c(neu_univar$hr, " (", neu_univar$full_ci, ")"), NA,
+                 NA, str_c(linf_univar$hr, " (", linf_univar$full_ci, ")"), NA,
+                 NA, str_c(cpk_univar$hr, " (", cpk_univar$full_ci, ")"), NA,
+                 NA, str_c(dhl_univar$hr, " (", dhl_univar$full_ci, ")"), NA,
+                 NA, str_c(ferr_univar$hr, " (", ferr_univar$full_ci, ")"), NA,
+                 NA, str_c(pcr_univar$hr, " (", pcr_univar$full_ci, ")"), NA,
+                 NA, str_c(dd_univar$hr, " (", dd_univar$full_ci, ")"), NA,
+                 NA, str_c(trop_univar$hr, " (", trop_univar$full_ci, ")"))
+
+multivariados <- c(NA, str_c(nlymr_mv$hr, " (", nlymr_mv$full_ci, ")"), NA,
+                   NA, str_c(dnlr_mv$hr, " (", dnlr_mv$full_ci, ")"), NA,
+                   NA, str_c(plr_mv$hr, " (", plr_mv$full_ci, ")"), NA,
+                   NA, str_c(lmr_mv$hr, " (", lmr_mv$full_ci, ")"), NA,
+                   NA, str_c(neu_mv$hr, " (", neu_mv$full_ci, ")"), NA,
+                   NA, str_c(linf_mv$hr, " (", linf_mv$full_ci, ")"), NA,
+                   NA, str_c(cpk_mv$hr, " (", cpk_mv$full_ci, ")"), NA,
+                   NA, str_c(dhl_mv$hr, " (", dhl_mv$full_ci, ")"), NA,
+                   NA, str_c(ferr_mv$hr, " (", ferr_mv$full_ci, ")"), NA,
+                   NA, str_c(pcr_mv$hr, " (", pcr_mv$full_ci, ")"), NA,
+                   NA, str_c(dd_mv$hr, " (", dd_mv$full_ci, ")"), NA,
+                   NA, str_c(trop_mv$hr, " (", trop_mv$full_ci, ")"))
+
+
+tabla_2_df <- data.frame(Variable = variables_tabla_2,
+                                        Modelos_de_Cox_univariados = univariados,
+                                        Modelos_de_Cox_multivariados = multivariados)
+View(tabla_2_df)
+
+tabla_2 <- autofit(flextable(tabla_2_df))
+```
+
+
+```{r guardar la base de trabajo y calculos para manuscrito, include = F}
+#write.csv(covid_full_4, file = "base_de_trabajo.csv")
+save(covid_full_4, file = "covid_full_4.Rda")
+
+range(covid_full_4$fecha_ing_urg)
+
+base_trabajo <- filter(covid_full_4, fecha_ing_urg >= "2020-03-21")
+
+#Porcentaje que tenían diabetes o hipertensión
+sum(base_trabajo$hipertension == T | base_trabajo$diabetes == T)
+sum(base_trabajo$hipertension == T | base_trabajo$diabetes == T)/nrow(base_trabajo)
+
+#Porcentaje que tenían algún síntoma
+sum(base_trabajo$disnea == T | base_trabajo$tos == T | base_trabajo$fiebre == T |
+      base_trabajo$dolor_toracico == T | base_trabajo$cefalea == T |base_trabajo$mialgias == T |
+      base_trabajo$diarrea == T )
+
+#Índices hematológicos (anemia, leucocitosis / leucopenia, plaquetopenia)
+nrow(filter(base_trabajo, linfocitos_totales<1000))
+nrow(filter(base_trabajo, leucocitos_ingreso>10))
+nrow(filter(base_trabajo, hb_ingreso<12))
+nrow(filter(base_trabajo, plaquetas_ingreso<150))
+nrow(filter(base_trabajo, plaquetas_ingreso<100))
+
+#Marcadores inflamatorios
+nrow(filter(base_trabajo, pcr_ingreso >1))
+nrow(filter(base_trabajo, pcr_ingreso >1))/nrow(base_trabajo)
+
+
+#Pacientes con un desenlace
+nrow(filter(base_trabajo, muerte == T | ing_uti == T))
+nrow(filter(base_trabajo, muerte == T | ing_uti == T | egreso == T))
+nrow(filter(base_trabajo, muerte == T))
+nrow(filter(base_trabajo, ing_uti == T))
+nrow(filter(base_trabajo, muerte == T | ing_uti == T))/nrow(base_trabajo)
+```
+
